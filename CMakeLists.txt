@@ -1,0 +1,92 @@
+cmake_minimum_required(VERSION 3.26)
+project(MUTF8 LANGUAGES C)
+
+include(CMakeDependentOption)
+include(GNUInstallDirs)
+
+option(MUTF8_BUILD_EXECUTABLES "Build executable binaries" PROJECT_IS_TOP_LEVEL)
+option(MUTF8_BUILD_WITH_SANITIZERS "Build with ASAN and UBSAN" OFF)
+cmake_dependent_option(MUTF8_BUILD_FUZZ_TESTS "Build fuzz test binaries" PROJECT_IS_TOP_LEVEL [[CMAKE_C_COMPILER_ID STREQUAL "Clang"]] OFF)
+
+set(CMAKE_C_EXTENSIONS OFF)
+
+add_library(mutf8_options INTERFACE)
+if(CMAKE_C_COMPILER_FRONTEND_VARIANT STREQUAL "GNU")
+    target_compile_options(mutf8_options INTERFACE -Wall -Wextra)
+    if(MUTF8_BUILD_WITH_SANITIZERS)
+        target_compile_options(mutf8_options INTERFACE -fsanitize=address -fsanitize=undefined -fno-omit-frame-pointer)
+        target_link_options(mutf8_options INTERFACE -fsanitize=address -fsanitize=undefined)
+    endif()
+elseif(CMAKE_C_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    target_compile_options(mutf8_options INTERFACE /W4)
+    if(MUTF8_BUILD_WITH_SANITIZERS)
+        target_compile_options(mutf8_options INTERFACE /fsanitize=address)
+        target_link_options(mutf8_options INTERFACE /fsanitize=address)
+    endif()    
+else()
+    message(WARNING "This compiler frontend is not supported")
+    if(MUTF8_BUILD_WITH_SANITIZERS)
+        message(SEND_ERROR "Cannot enable sanitizers for this compiler frontend")
+    endif()
+endif()
+
+add_library(MUTF8 STATIC)
+add_library(MUTF8::MUTF8 ALIAS MUTF8)
+target_sources(MUTF8 PRIVATE mutf8.c)
+target_sources(MUTF8 PUBLIC FILE_SET HEADERS FILES mutf8.h)
+target_compile_features(MUTF8 PUBLIC c_std_99)
+target_link_libraries(MUTF8 PRIVATE "$<BUILD_LOCAL_INTERFACE:mutf8_options>")
+set_target_properties(MUTF8 PROPERTIES OUTPUT_NAME "mutf8")
+
+install(TARGETS MUTF8 EXPORT MUTF8Targets FILE_SET HEADERS)
+install(EXPORT MUTF8Targets DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/MUTF8" NAMESPACE MUTF8::)
+export(EXPORT MUTF8Targets FILE "${CMAKE_CURRENT_BINARY_DIR}/cmake/MUTF8Targets.cmake" NAMESPACE MUTF8::)
+
+if(MUTF8_BUILD_EXECUTABLES)
+    add_executable(mutf8encode)
+    target_sources(mutf8encode PRIVATE mutf8encode.main.c)
+    target_compile_features(mutf8encode PRIVATE c_std_11)
+    target_link_libraries(mutf8encode PRIVATE MUTF8 mutf8_options)
+    
+    add_executable(mutf8decode)
+    target_sources(mutf8decode PRIVATE mutf8decode.main.c)
+    target_compile_features(mutf8decode PRIVATE c_std_11)
+    target_link_libraries(mutf8decode PRIVATE MUTF8 mutf8_options)
+
+    install(TARGETS mutf8encode mutf8decode)
+endif(MUTF8_BUILD_EXECUTABLES)
+
+if(MUTF8_BUILD_FUZZ_TESTS)
+    add_library(mutf8_fuzz INTERFACE)
+    target_compile_options(mutf8_fuzz INTERFACE -fsanitize=fuzzer)
+    target_link_options(mutf8_fuzz INTERFACE -fsanitize=fuzzer)
+    
+    add_executable(mutf8_fuzz_c16tomutf8 tests/c16tomutf8.fuzz.c)
+    target_link_libraries(mutf8_fuzz_c16tomutf8 PRIVATE MUTF8 mutf8_options mutf8_fuzz)
+
+    add_executable(mutf8_fuzz_mutf8toc16 tests/mutf8toc16.fuzz.c)
+    target_link_libraries(mutf8_fuzz_mutf8toc16 PRIVATE MUTF8 mutf8_options mutf8_fuzz)
+endif(MUTF8_BUILD_FUZZ_TESTS)
+
+if(NOT PROJECT_IS_TOP_LEVEL)
+    return()
+endif()
+
+include(CTest)
+
+if(MUTF8_BUILD_EXECUTABLES)
+    add_test(NAME EncodeEmpty COMMAND zsh -c [[cmp <(printf %s $'') <(printf %s $'' | $<TARGET_FILE:mutf8encode>)]])
+    add_test(NAME EncodeSimple COMMAND zsh -c [[cmp <(printf %s $'\x61\x62\x63') <(printf %s $'abc' | $<TARGET_FILE:mutf8encode>)]])
+    add_test(NAME EncodeNull COMMAND zsh -c [[cmp <(printf %s $'\x61\x62\xC0\x80\x63\x64') <(printf %s $'ab\0cd' | $<TARGET_FILE:mutf8encode>)]])
+    add_test(NAME EncodeSMP COMMAND zsh -c [[cmp <(printf %s $'\xED\xA0\x80\xED\xB0\x80') <(printf %s $'𐀀' | $<TARGET_FILE:mutf8encode>)]])
+
+    add_test(NAME DecodeEmpty COMMAND zsh -c [[cmp <(printf %s $'') <(printf %s $'' | $<TARGET_FILE:mutf8decode>)]])
+    add_test(NAME DecodeSimple COMMAND zsh -c [[cmp <(printf %s $'abc') <(printf %s $'\x61\x62\x63' | $<TARGET_FILE:mutf8decode>)]])
+    add_test(NAME DecodeNull COMMAND zsh -c [[cmp <(printf %s $'ab\0cd') <(printf %s $'\x61\x62\xC0\x80\x63\x64' | $<TARGET_FILE:mutf8decode>)]])
+    add_test(NAME DecodeSMP COMMAND zsh -c [[cmp <(printf %s $'𐀀') <(printf %s $'\xED\xA0\x80\xED\xB0\x80' | $<TARGET_FILE:mutf8decode>)]])
+
+    add_test(NAME RoundtripEmpty COMMAND zsh -c [[cmp <(printf %s $'') <(printf %s $'' | $<TARGET_FILE:mutf8encode> | $<TARGET_FILE:mutf8decode>)]])
+    add_test(NAME RoundtripSimple COMMAND zsh -c [[cmp <(printf %s $'abc') <(printf %s $'abc' | $<TARGET_FILE:mutf8encode> | $<TARGET_FILE:mutf8decode>)]])
+    add_test(NAME RoundtripNull COMMAND zsh -c [[cmp <(printf %s $'ab\0cd') <(printf %s $'ab\0cd' | $<TARGET_FILE:mutf8encode> | $<TARGET_FILE:mutf8decode>)]])
+    add_test(NAME RoundtripSMP COMMAND zsh -c [[cmp <(printf %s $'𐀀𐀁𐀂𐀃') <(printf %s $'𐀀𐀁𐀂𐀃' | $<TARGET_FILE:mutf8encode> | $<TARGET_FILE:mutf8decode>)]])
+endif(MUTF8_BUILD_EXECUTABLES)
